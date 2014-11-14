@@ -14,7 +14,8 @@
 ;; See the License for the specific language governing permissions and
 ;; limitations under the License.
 (ns backtype.storm.daemon.nimbus
-  (:import [java.nio ByteBuffer])
+  (:import [java.nio ByteBuffer]
+           [java.util Collections])
   (:import [java.io FileNotFoundException])
   (:import [java.nio.channels Channels WritableByteChannel])
   (:import [backtype.storm.security.auth ThriftServer ThriftConnectionType ReqContext AuthUtils])
@@ -81,11 +82,12 @@
      :validator (new-instance (conf NIMBUS-TOPOLOGY-VALIDATOR))
      :timer (mk-timer :kill-fn (fn [t]
                                  (log-error t "Error when processing event")
-                                 (halt-process! 20 "Error when processing an event")
+                                 (exit-process! 20 "Error when processing an event")
                                  ))
      :scheduler (mk-scheduler conf inimbus)
      :id->sched-status (atom {})
      :cred-renewers (AuthUtils/GetCredentialRenewers conf)
+     :nimbus-autocred-plugins (AuthUtils/getNimbusAutoCredPlugins conf)
      }))
 
 (defn inbox [nimbus]
@@ -620,7 +622,9 @@
     new-topology->executor->node+port))
 
 (defn changed-executors [executor->node+port new-executor->node+port]
-  (let [slot-assigned (reverse-map executor->node+port)
+  (let [executor->node+port (if executor->node+port (sort executor->node+port) nil)
+        new-executor->node+port (if new-executor->node+port (sort new-executor->node+port) nil)
+        slot-assigned (reverse-map executor->node+port)
         new-slot-assigned (reverse-map new-executor->node+port)
         brand-new-slots (map-diff slot-assigned new-slot-assigned)]
     (apply concat (vals brand-new-slots))
@@ -857,23 +861,6 @@
           (swap! (:heartbeats-cache nimbus) dissoc id))
         ))))
 
-(defn renew-credentials [nimbus]
-  (let [storm-cluster-state (:storm-cluster-state nimbus)
-        renewers (:cred-renewers nimbus)
-        update-lock (:cred-update-lock nimbus)
-        assigned-ids (set (.active-storms storm-cluster-state))]
-    (when-not (empty? assigned-ids)
-      (doseq [id assigned-ids]
-        (locking update-lock
-          (let [orig-creds (.credentials storm-cluster-state id nil)]
-            (if orig-creds
-              (let [new-creds (HashMap. orig-creds)]
-                (doseq [renewer renewers]
-                  (log-message "Renewing Creds For " id " with " renewer))
-                (when-not (= orig-creds new-creds)
-                  (.set-credentials! storm-cluster-state id new-creds)
-              )))))))))
-
 (defn- file-older-than? [now seconds file]
   (<= (+ (.lastModified file) (to-millis seconds)) (to-millis now)))
 
@@ -901,7 +888,9 @@
 
 (defn- get-errors [storm-cluster-state storm-id component-id]
   (->> (.errors storm-cluster-state storm-id component-id)
-       (map #(ErrorInfo. (:error %) (:time-secs %)))))
+       (map #(doto (ErrorInfo. (:error %) (:time-secs %))
+                   (.set_host (:host %))
+                   (.set_port (:port %))))))
 
 (defn- thriftify-executor-id [[first-task-id last-task-id]]
   (ExecutorInfo. (int first-task-id) (int last-task-id)))
@@ -948,6 +937,25 @@
        (throw (NotAliveException. (str storm-id))))
   )
 )
+
+(defn renew-credentials [nimbus]
+  (let [storm-cluster-state (:storm-cluster-state nimbus)
+        renewers (:cred-renewers nimbus)
+        update-lock (:cred-update-lock nimbus)
+        assigned-ids (set (.active-storms storm-cluster-state))]
+    (when-not (empty? assigned-ids)
+      (doseq [id assigned-ids]
+        (locking update-lock
+          (let [orig-creds (.credentials storm-cluster-state id nil)
+                topology-conf (try-read-storm-conf (:conf nimbus) id)]
+            (if orig-creds
+              (let [new-creds (HashMap. orig-creds)]
+                (doseq [renewer renewers]
+                  (log-message "Renewing Creds For " id " with " renewer)
+                  (.renew renewer new-creds (Collections/unmodifiableMap topology-conf)))
+                (when-not (= orig-creds new-creds)
+                  (.set-credentials! storm-cluster-state id new-creds topology-conf)
+                  )))))))))
 
 (defn validate-topology-size [topo-conf nimbus-conf topology]
   (let [workers-count (get topo-conf TOPOLOGY-WORKERS)
@@ -1043,7 +1051,10 @@
                                 (dissoc storm-conf STORM-ZOOKEEPER-TOPOLOGY-AUTH-SCHEME STORM-ZOOKEEPER-TOPOLOGY-AUTH-PAYLOAD))
                 total-storm-conf (merge conf storm-conf)
                 topology (normalize-topology total-storm-conf topology)
+
                 storm-cluster-state (:storm-cluster-state nimbus)]
+            (when credentials (doseq [nimbus-autocred-plugin (:nimbus-autocred-plugins nimbus)]
+              (.populateCredentials nimbus-autocred-plugin credentials (Collections/unmodifiableMap storm-conf))))
             (if (and (conf SUPERVISOR-RUN-WORKER-AS-USER) (or (nil? submitter-user) (.isEmpty (.trim submitter-user)))) 
               (throw (AuthorizationException. "Could not determine the user to run this topology as.")))
             (system-topology! total-storm-conf topology) ;; this validates the structure of the topology
@@ -1301,10 +1312,11 @@
 (defn launch-server! [conf nimbus]
   (validate-distributed-mode! conf)
   (let [service-handler (service-handler conf nimbus)
-        ;;TODO need to honor NIMBUS-THRIFT-MAX-BUFFER-SIZE for different transports
         server (ThriftServer. conf (Nimbus$Processor. service-handler) 
                               ThriftConnectionType/NIMBUS)]
-    (.addShutdownHook (Runtime/getRuntime) (Thread. (fn [] (.shutdown service-handler) (.stop server))))
+    (add-shutdown-hook-with-force-kill-in-1-sec (fn []
+                                                  (.shutdown service-handler)
+                                                  (.stop server)))
     (log-message "Starting Nimbus server...")
     (.serve server)
     service-handler))

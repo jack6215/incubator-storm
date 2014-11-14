@@ -40,10 +40,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.zip.GZIPOutputStream;
+import java.util.zip.GZIPInputStream;
 
+import backtype.storm.serialization.DefaultSerializationDelegate;
+import backtype.storm.serialization.SerializationDelegate;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
-import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.commons.lang.StringUtils;
 import org.apache.thrift.TException;
 import org.apache.zookeeper.ZooDefs;
@@ -65,8 +68,15 @@ import clojure.lang.IFn;
 import clojure.lang.RT;
 
 public class Utils {
-    public static Logger LOG = LoggerFactory.getLogger(Utils.class);    
+    private static final Logger LOG = LoggerFactory.getLogger(Utils.class);
     public static final String DEFAULT_STREAM_ID = "default";
+
+    private static SerializationDelegate serializationDelegate;
+
+    static {
+        Map conf = readStormConfig();
+        serializationDelegate = getSerializationDelegate(conf);
+    }
 
     public static Object newInstance(String klass) {
         try {
@@ -76,31 +86,13 @@ public class Utils {
             throw new RuntimeException(e);
         }
     }
-    
+ 
     public static byte[] serialize(Object obj) {
-        try {
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            ObjectOutputStream oos = new ObjectOutputStream(bos);
-            oos.writeObject(obj);
-            oos.close();
-            return bos.toByteArray();
-        } catch(IOException ioe) {
-            throw new RuntimeException(ioe);
-        }
+        return serializationDelegate.serialize(obj);
     }
 
     public static Object deserialize(byte[] serialized) {
-        try {
-            ByteArrayInputStream bis = new ByteArrayInputStream(serialized);
-            ObjectInputStream ois = new ObjectInputStream(bis);
-            Object ret = ois.readObject();
-            ois.close();
-            return ret;
-        } catch(IOException ioe) {
-            throw new RuntimeException(ioe);
-        } catch(ClassNotFoundException e) {
-            throw new RuntimeException(e);
-        }
+        return serializationDelegate.deserialize(serialized);
     }
 
     public static <T> String join(Iterable<T> coll, String sep) {
@@ -310,44 +302,52 @@ public class Utils {
     }
     
     public static Integer getInt(Object o) {
-        if(o instanceof Long) {
-            return ((Long) o ).intValue();
-        } else if (o instanceof Integer) {
-            return (Integer) o;
-        } else if (o instanceof Short) {
-            return ((Short) o).intValue();
-        } else if (o instanceof String) {
-            return Integer.parseInt((String) o);
-        } else {
-            throw new IllegalArgumentException("Don't know how to convert " + o + " + to int");
-        }
+      Integer result = getInt(o, null);
+      if (null == result) {
+        throw new IllegalArgumentException("Don't know how to convert null to int");
+      }
+      return result;
+    }
+    
+    public static Integer getInt(Object o, Integer defaultValue) {
+      if (null == o) {
+        return defaultValue;
+      }
+
+      if (o instanceof Integer ||
+          o instanceof Short ||
+          o instanceof Byte) {
+          return ((Number) o).intValue();
+      } else if (o instanceof Long) {
+          final long l = (Long) o;
+          if (l <= Integer.MAX_VALUE && l >= Integer.MIN_VALUE) {
+              return (int) l;
+          }
+      } else if (o instanceof String) {
+          return Integer.parseInt((String) o);
+      }
+
+      throw new IllegalArgumentException("Don't know how to convert " + o + " to int");
+    }
+
+    public static boolean getBoolean(Object o, boolean defaultValue) {
+      if (null == o) {
+        return defaultValue;
+      }
+      
+      if(o instanceof Boolean) {
+          return (Boolean) o;
+      } else {
+          throw new IllegalArgumentException("Don't know how to convert " + o + " + to boolean");
+      }
     }
     
     public static long secureRandomLong() {
         return UUID.randomUUID().getLeastSignificantBits();
     }
     
-    public static class BoundedExponentialBackoffRetry extends ExponentialBackoffRetry {
-
-        protected final int maxRetryInterval;
-
-        public BoundedExponentialBackoffRetry(int baseSleepTimeMs, 
-                int maxRetries, int maxSleepTimeMs) {
-            super(baseSleepTimeMs, maxRetries);
-            this.maxRetryInterval = maxSleepTimeMs;
-        }
-
-        public int getMaxRetryInterval() {
-            return this.maxRetryInterval;
-        }
-
-        @Override
-        public int getSleepTimeMs(int count, long elapsedMs)
-        {
-            return Math.min(maxRetryInterval,
-                    super.getSleepTimeMs(count, elapsedMs));
-        }
-
+    public static CuratorFramework newCurator(Map conf, List<String> servers, Object port, String root) {
+        return newCurator(conf, servers, port, root, null);
     }
 
     public static CuratorFramework newCurator(Map conf, List<String> servers, Object port, String root, ZookeeperAuthInfo auth) {
@@ -368,10 +368,11 @@ public class Utils {
         builder.connectString(zkStr)
             .connectionTimeoutMs(Utils.getInt(conf.get(Config.STORM_ZOOKEEPER_CONNECTION_TIMEOUT)))
             .sessionTimeoutMs(Utils.getInt(conf.get(Config.STORM_ZOOKEEPER_SESSION_TIMEOUT)))
-            .retryPolicy(new BoundedExponentialBackoffRetry(
-                            Utils.getInt(conf.get(Config.STORM_ZOOKEEPER_RETRY_INTERVAL)),
-                            Utils.getInt(conf.get(Config.STORM_ZOOKEEPER_RETRY_TIMES)),
-                            Utils.getInt(conf.get(Config.STORM_ZOOKEEPER_RETRY_INTERVAL_CEILING))));
+            .retryPolicy(new StormBoundedExponentialBackoffRetry(
+                        Utils.getInt(conf.get(Config.STORM_ZOOKEEPER_RETRY_INTERVAL)),
+                        Utils.getInt(conf.get(Config.STORM_ZOOKEEPER_RETRY_INTERVAL_CEILING)),
+                        Utils.getInt(conf.get(Config.STORM_ZOOKEEPER_RETRY_TIMES))));
+
         if(auth!=null && auth.scheme!=null && auth.payload!=null) {
             builder = builder.authorization(auth.scheme, auth.payload);
         }
@@ -511,4 +512,25 @@ public class Utils {
        }
        return dump.toString();
    }
+
+    // Assumes caller is synchronizing
+    private static SerializationDelegate getSerializationDelegate(Map stormConf) {
+        String delegateClassName = (String)stormConf.get(Config.STORM_META_SERIALIZATION_DELEGATE);
+        SerializationDelegate delegate;
+        try {
+            Class delegateClass = Class.forName(delegateClassName);
+            delegate = (SerializationDelegate) delegateClass.newInstance();
+        } catch (ClassNotFoundException e) {
+            LOG.error("Failed to construct serialization delegate, falling back to default", e);
+            delegate = new DefaultSerializationDelegate();
+        } catch (InstantiationException e) {
+            LOG.error("Failed to construct serialization delegate, falling back to default", e);
+            delegate = new DefaultSerializationDelegate();
+        } catch (IllegalAccessException e) {
+            LOG.error("Failed to construct serialization delegate, falling back to default", e);
+            delegate = new DefaultSerializationDelegate();
+        }
+        delegate.prepare(stormConf);
+        return delegate;
+    }
 }

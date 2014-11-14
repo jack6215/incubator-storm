@@ -54,7 +54,26 @@ must have it set to the actual port that they are going to bind to.
 
 The servlet filters are prefered because it allows indavidual topologies to
 specificy who is and who is not allowed to access the pages associated with
-them.
+them.  
+
+Storm UI can be configured to use AuthenticationFilter from hadoop-auth.
+```yaml
+ui.filter: "org.apache.hadoop.security.authentication.server.AuthenticationFilter"
+ui.filter.params:
+   "type": "kerberos"
+   "kerberos.principal": "HTTP/nimbus.witzend.com"
+   "kerberos.keytab": "/vagrant/keytabs/http.keytab"
+   "kerberos.name.rules": "RULE:[2:$1@$0]([jt]t@.*EXAMPLE.COM)s/.*/$MAPRED_USER/ RULE:[2:$1@$0]([nd]n@.*EXAMPLE.COM)s/.*/$HDFS_USER/DEFAULT"
+```
+make sure to create a prinicpal 'HTTP/{hostname}' (here hostname should be the one where UI daemon runs
+
+Once configured users needs to do kinit before accessing UI.
+Ex:
+curl  -i --negotiate -u:anyUser  -b ~/cookiejar.txt -c ~/cookiejar.txt  http://storm-ui-hostname:8080/api/v1/cluster/summary
+
+1) Firefox: Goto about:config and search for network.negotiate-auth.trusted-uris double-click to  add value "http://storm-ui-hostname:8080"
+2) Google-chrome:  start from command line with: google-chrome --auth-server-whitelist="*storm-ui-hostname" --auth-negotiate-delegate-whitelist="*storm-ui-hostname"   
+3) IE:  Configure trusted websites to include "storm-ui-hostname" and allow negotiation for that website 
 
 ## Authentication (Kerberos)
 
@@ -316,6 +335,18 @@ On a kerberos secure cluster they should be set by default to point to backtype.
 
 nimbus.credential.renewers.freq.secs controls how often the renewer will poll to see if anything needs to be renewed, but the default should be fine.
 
+#### Automatic HDFS credential push and renewal
+If your topology is going to use secure HDFS , your administrator can configure nimbus to automatically get delegation tokens on behalf of the topology submitter user. The nimbus need to start with 
+nimbus.autocredential.plugins.classes=backtype.storm.security.auth.hadoop.AutoHDFS and nimbus.credential.renewers.classes=backtype.storm.security.auth.hadoop.AutoHDFS. Your topology configuration
+should  have topology.auto-credentials=backtype.storm.security.auth.hadoop.AutoHDFS so workers can automatically get the credentials in the Subject.
+
+If nimbus did not have the above configuration you need to add it and then restart it. Ensure all the hadoop configuration files are present in the nimbus' classpath. Please read more about setting up
+secure hadoop on http://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-common/SecureMode.html.
+
+You also need to ensure that nimbus user is allowed to act as a super user and get delegation tokens on behalf of other users. To achieve this you need to follow configuration directions listed on this link
+http://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-common/Superusers.html.
+
+
 ### Limits
 By default storm allows any sized topology to be submitted. But ZK and others have limitations on how big a topology can actually be.  The following configs allow you to limit the maximum size a topology can be.
 
@@ -335,7 +366,3 @@ The Logviewer deamon now is also responsible for cleaning up old log files for d
 
 ### DRPC
 Hopefully more on this soon
-
-
-
-  

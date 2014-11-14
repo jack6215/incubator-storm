@@ -19,6 +19,10 @@ package backtype.storm.task;
 
 import backtype.storm.Config;
 import backtype.storm.generated.ShellComponent;
+import backtype.storm.metric.api.IMetric;
+import backtype.storm.metric.api.rpc.IShellMetric;
+import backtype.storm.topology.ReportedFailedException;
+import backtype.storm.tuple.MessageId;
 import backtype.storm.tuple.Tuple;
 import backtype.storm.utils.ShellProcess;
 import backtype.storm.multilang.BoltMsg;
@@ -76,6 +80,8 @@ public class ShellBolt implements IBolt {
 
     private Thread _readerThread;
     private Thread _writerThread;
+    
+    private TopologyContext _context;
 
     public ShellBolt(ShellComponent component) {
         this(component.get_execution_command(), component.get_script());
@@ -93,6 +99,9 @@ public class ShellBolt implements IBolt {
         }
         _rand = new Random();
         _collector = collector;
+
+        _context = context;
+
         _process = new ShellProcess(_command);
 
         //subprocesses must send their pid first thing
@@ -107,6 +116,9 @@ public class ShellBolt implements IBolt {
                         ShellMsg shellMsg = _process.readShellMsg();
 
                         String command = shellMsg.getCommand();
+                        if (command == null) {
+                            throw new IllegalArgumentException("Command not found in bolt message: " + shellMsg);
+                        }
                         if(command.equals("ack")) {
                             handleAck(shellMsg.getId());
                         } else if (command.equals("fail")) {
@@ -114,10 +126,11 @@ public class ShellBolt implements IBolt {
                         } else if (command.equals("error")) {
                             handleError(shellMsg.getMsg());
                         } else if (command.equals("log")) {
-                            String msg = shellMsg.getMsg();
-                            LOG.info("Shell msg: " + msg);
+                            handleLog(shellMsg);
                         } else if (command.equals("emit")) {
                             handleEmit(shellMsg);
+                        } else if (command.equals("metrics")) {
+                            handleMetrics(shellMsg);
                         }
                     } catch (InterruptedException e) {
                     } catch (Throwable t) {
@@ -170,12 +183,15 @@ public class ShellBolt implements IBolt {
 
             _pendingWrites.put(boltMsg);
         } catch(InterruptedException e) {
-            throw new RuntimeException("Error during multilang processing", e);
+            String processInfo = _process.getProcessInfoString() + _process.getProcessTerminationInfoString();
+            throw new RuntimeException("Error during multilang processing " + processInfo, e);
         }
     }
 
     public void cleanup() {
         _running = false;
+        _writerThread.interrupt();
+        _readerThread.interrupt();
         _process.destroy();
         _inputs.clear();
     }
@@ -224,7 +240,69 @@ public class ShellBolt implements IBolt {
         }
     }
 
+    private void handleLog(ShellMsg shellMsg) {
+        String msg = shellMsg.getMsg();
+        msg = "ShellLog " + _process.getProcessInfoString() + " " + msg;
+        ShellMsg.ShellLogLevel logLevel = shellMsg.getLogLevel();
+
+        switch (logLevel) {
+            case TRACE:
+                LOG.trace(msg);
+                break;
+            case DEBUG:
+                LOG.debug(msg);
+                break;
+            case INFO:
+                LOG.info(msg);
+                break;
+            case WARN:
+                LOG.warn(msg);
+                break;
+            case ERROR:
+                LOG.error(msg);
+                _collector.reportError(new ReportedFailedException(msg));
+                break;
+            default:
+                LOG.info(msg);
+                break;
+        }
+    }
+
+    private void handleMetrics(ShellMsg shellMsg) {
+        //get metric name
+        String name = shellMsg.getMetricName();
+        if (name.isEmpty()) {
+            throw new RuntimeException("Receive Metrics name is empty");
+        }
+        
+        //get metric by name
+        IMetric iMetric = _context.getRegisteredMetricByName(name);
+        if (iMetric == null) {
+            throw new RuntimeException("Could not find metric by name["+name+"] ");
+        }
+        if ( !(iMetric instanceof IShellMetric)) {
+            throw new RuntimeException("Metric["+name+"] is not IShellMetric, can not call by RPC");
+        }
+        IShellMetric iShellMetric = (IShellMetric)iMetric;
+        
+        //call updateMetricFromRPC with params
+        Object paramsObj = shellMsg.getMetricParams();
+        try {
+            iShellMetric.updateMetricFromRPC(paramsObj);
+        } catch (RuntimeException re) {
+            throw re;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }       
+    }
+
     private void die(Throwable exception) {
-        _exception = exception;
+        String processInfo = _process.getProcessInfoString() + _process.getProcessTerminationInfoString();
+        _exception = new RuntimeException(processInfo, exception);
+        LOG.error("Halting process: ShellBolt died.", exception);
+        _collector.reportError(exception);
+        if (_running || (exception instanceof Error)) { //don't exit if not running, unless it is an Error
+            System.exit(11);
+        }
     }
 }

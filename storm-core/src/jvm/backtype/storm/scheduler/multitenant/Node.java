@@ -127,10 +127,19 @@ public class Node {
   boolean assignInternal(WorkerSlot ws, String topId, boolean dontThrow) {
     validateSlot(ws);
     if (!_freeSlots.remove(ws)) {
-      if (dontThrow) {
-        return true;
+      for (Entry<String, Set<WorkerSlot>> topologySetEntry : _topIdToUsedSlots.entrySet()) {
+        if (topologySetEntry.getValue().contains(ws)) {
+          if (dontThrow) {
+            LOG.warn("Worker slot [" + ws + "] can't be assigned to " + topId +
+                    ". Its already assigned to " + topologySetEntry.getKey() + ".");
+            return true;
+          }
+          throw new IllegalStateException("Worker slot [" + ws + "] can't be assigned to "
+                  + topId + ". Its already assigned to " + topologySetEntry.getKey() + ".");
+        }
       }
-      throw new IllegalStateException("Assigning a slot that was not free " + ws);
+      LOG.warn("Adding Worker slot [" + ws + "] that was not reported in the supervisor heartbeats," +
+              " but the worker is already running for topology " + topId + ".");
     }
     Set<WorkerSlot> usedSlots = _topIdToUsedSlots.get(topId);
     if (usedSlots == null) {
@@ -163,8 +172,9 @@ public class Node {
    * @param ws the slot to free
    * @param cluster the cluster to update
    */
-  public void free(WorkerSlot ws, Cluster cluster) {
+  public void free(WorkerSlot ws, Cluster cluster, boolean forceFree) {
     if (_freeSlots.contains(ws)) return;
+    boolean wasFound = false;
     for (Entry<String, Set<WorkerSlot>> entry : _topIdToUsedSlots.entrySet()) {
       Set<WorkerSlot> slots = entry.getValue();
       if (slots.remove(ws)) {
@@ -172,11 +182,21 @@ public class Node {
         if (_isAlive) {
           _freeSlots.add(ws);
         }
-        return;
+        wasFound = true;
       }
     }
-    throw new IllegalArgumentException("Tried to free a slot that was not" +
-    		" part of this node " + _nodeId);
+    if(!wasFound)
+    {
+      if(forceFree)
+      {
+        LOG.info("Forcefully freeing the " + ws);
+        cluster.freeSlot(ws);
+        _freeSlots.add(ws);
+      } else {
+        throw new IllegalArgumentException("Tried to free a slot that was not" +
+              " part of this node " + _nodeId);
+      }
+    }
   }
    
   /**
@@ -280,7 +300,7 @@ public class Node {
       //Node ID and supervisor ID are the same.
       String id = sup.getId();
       boolean isAlive = !cluster.isBlackListed(id);
-      LOG.debug("Found a {} Node {} {}", 
+      LOG.debug("Found a {} Node {} {}",
           new Object[] {isAlive? "living":"dead", id, sup.getAllPorts()});
       nodeIdToNode.put(id, new Node(id, sup.getAllPorts(), isAlive));
     }
@@ -300,8 +320,9 @@ public class Node {
           node.addOrphanedSlot(ws);
         }
         if (node.assignInternal(ws, topId, true)) {
-          LOG.warn("Bad scheduling state, "+ws+" assigned multiple workers, unassigning everything...");
-          node.free(ws, cluster);
+          LOG.warn("Bad scheduling state for topology [" + topId+ "], the slot " +
+                  ws + " assigned to multiple workers, un-assigning everything...");
+          node.free(ws, cluster, true);
         }
       }
     }

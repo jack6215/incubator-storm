@@ -13,13 +13,15 @@
 ;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 ;; See the License for the specific language governing permissions and
 ;; limitations under the License.
+
 (ns backtype.storm.daemon.drpc
   (:import [backtype.storm.security.auth AuthUtils ThriftServer ThriftConnectionType])
   (:import [backtype.storm.security.auth.authorizer DRPCAuthorizerBase])
   (:import [backtype.storm.generated DistributedRPC DistributedRPC$Iface DistributedRPC$Processor
             DRPCRequest DRPCExecutionException DistributedRPCInvocations DistributedRPCInvocations$Iface
             DistributedRPCInvocations$Processor])
-  (:import [java.util.concurrent Semaphore ConcurrentLinkedQueue ThreadPoolExecutor ArrayBlockingQueue TimeUnit])
+  (:import [java.util.concurrent Semaphore ConcurrentLinkedQueue
+            ThreadPoolExecutor ArrayBlockingQueue TimeUnit])
   (:import [backtype.storm.daemon Shutdownable])
   (:import [java.net InetAddress])
   (:import [backtype.storm.generated AuthorizationException])
@@ -28,21 +30,19 @@
   (:use [backtype.storm.ui helpers])
   (:use compojure.core)
   (:use ring.middleware.reload)
-  (:use [ring.adapter.jetty :only [run-jetty]])
   (:require [compojure.handler :as handler])
   (:gen-class))
 
 (bootstrap)
 
-(def TIMEOUT-CHECK-SECS 5)
+(defn timeout-check-secs [] 5)
 
 (defn acquire-queue [queues-atom function]
   (swap! queues-atom
     (fn [amap]
       (if-not (amap function)
         (assoc amap function (ConcurrentLinkedQueue.))
-        amap)
-        ))
+        amap)))
   (@queues-atom function))
 
 (defn check-authorization
@@ -65,27 +65,28 @@
         id->sem (atom {})
         id->result (atom {})
         id->start (atom {})
-        id->func (atom {})
+        id->function (atom {})
+        id->request (atom {})
         request-queues (atom {})
         cleanup (fn [id] (swap! id->sem dissoc id)
-                         (swap! id->result dissoc id)
-                         (swap! id->start dissoc id)
-                         (swap! id->func dissoc id))
+                  (swap! id->result dissoc id)
+                  (swap! id->function dissoc id)
+                  (swap! id->request dissoc id)
+                  (swap! id->start dissoc id))
         my-ip (.getHostAddress (InetAddress/getLocalHost))
         clear-thread (async-loop
-                      (fn []
-                        (doseq [[id start] @id->start]
-                          (when (> (time-delta start) (conf DRPC-REQUEST-TIMEOUT-SECS))
-                            (when-let [sem (@id->sem id)]
-                              (swap! id->result assoc id (DRPCExecutionException. "Request timed out"))
-                              (.release sem))
-                            (cleanup id)
-                            ))
-                        TIMEOUT-CHECK-SECS
-                        ))
-        ]
+                       (fn []
+                         (doseq [[id start] @id->start]
+                           (when (> (time-delta start) (conf DRPC-REQUEST-TIMEOUT-SECS))
+                             (when-let [sem (@id->sem id)]
+                               (.remove (acquire-queue request-queues (@id->function id)) (@id->request id))
+                               (log-warn "Timeout DRPC request id: " id " start at " start)
+                               (.release sem))
+                             (cleanup id)))
+                         (timeout-check-secs)))]
     (reify DistributedRPC$Iface
-      (^String execute [this ^String function ^String args]
+      (^String execute
+        [this ^String function ^String args]
         (log-debug "Received DRPC request for " function " (" args ") at " (System/currentTimeMillis))
         (check-authorization drpc-acl-handler
                              {DRPCAuthorizerBase/FUNCTION_NAME function}
@@ -93,11 +94,11 @@
         (let [id (str (swap! ctr (fn [v] (mod (inc v) 1000000000))))
               ^Semaphore sem (Semaphore. 0)
               req (DRPCRequest. args id)
-              ^ConcurrentLinkedQueue queue (acquire-queue request-queues function)
-              ]
-          (swap! id->func assoc id function)
+              ^ConcurrentLinkedQueue queue (acquire-queue request-queues function)]
           (swap! id->start assoc id (current-time-secs))
           (swap! id->sem assoc id sem)
+          (swap! id->function assoc id function)
+          (swap! id->request assoc id req)
           (.add queue req)
           (log-debug "Waiting for DRPC result for " function " " args " at " (System/currentTimeMillis))
           (.acquire sem)
@@ -107,11 +108,15 @@
             (log-debug "Returning DRPC result for " function " " args " at " (System/currentTimeMillis))
             (if (instance? DRPCExecutionException result)
               (throw result)
-              result
-              ))))
+              (if (nil? result)
+                (throw (DRPCExecutionException. "Request timed out"))
+                result)))))
+
       DistributedRPCInvocations$Iface
-      (^void result [this ^String id ^String result]
-        (when-let [func (@id->func id)]
+
+      (^void result
+        [this ^String id ^String result]
+        (when-let [func (@id->function id)]
           (check-authorization drpc-acl-handler
                                {DRPCAuthorizerBase/FUNCTION_NAME func}
                                "result")
@@ -121,17 +126,20 @@
               (swap! id->result assoc id result)
               (.release sem)
               ))))
-      (^void failRequest [this ^String id]
-        (when-let [func (@id->func id)]
+
+      (^void failRequest
+        [this ^String id]
+        (when-let [func (@id->function id)]
           (check-authorization drpc-acl-handler
                                {DRPCAuthorizerBase/FUNCTION_NAME func}
                                "failRequest")
           (let [^Semaphore sem (@id->sem id)]
             (when sem
               (swap! id->result assoc id (DRPCExecutionException. "Request failed"))
-              (.release sem)
-              ))))
-      (^DRPCRequest fetchRequest [this ^String func]
+              (.release sem)))))
+
+      (^DRPCRequest fetchRequest
+        [this ^String func]
         (check-authorization drpc-acl-handler
                              {DRPCAuthorizerBase/FUNCTION_NAME func}
                              "fetchRequest")
@@ -139,13 +147,14 @@
               ret (.poll queue)]
           (if ret
             (do (log-debug "Fetched request for " func " at " (System/currentTimeMillis))
-                ret)
-            (DRPCRequest. "" ""))
-          ))
+              ret)
+            (DRPCRequest. "" ""))))
+
       Shutdownable
-      (shutdown [this]
-        (.interrupt clear-thread))
-      )))
+
+      (shutdown
+        [this]
+        (.interrupt clear-thread)))))
 
 (defn handle-request [handler]
   (fn [request]
@@ -180,9 +189,9 @@
           (if http-creds-handler
             (.populateContext http-creds-handler (ReqContext/context)
                               servlet-request))
-    (.execute handler func "")))
-                (wrap-reload '[backtype.storm.daemon.drpc])
-                handle-request))
+          (.execute handler func "")))
+    (wrap-reload '[backtype.storm.daemon.drpc])
+    handle-request))
 
 (defn launch-server!
   ([]
@@ -198,15 +207,15 @@
           ;; invocations that will unblock those threads
           handler-server (when (> drpc-port 0)
                            (ThriftServer. conf
-                             (DistributedRPC$Processor. service-handler)
+                             (DistributedRPC$Processor. drpc-service-handler)
                              ThriftConnectionType/DRPC))
           invoke-server (ThriftServer. conf
-                          (DistributedRPCInvocations$Processor. service-handler)
+                          (DistributedRPCInvocations$Processor. drpc-service-handler)
                           ThriftConnectionType/DRPC_INVOCATIONS)
           http-creds-handler (AuthUtils/GetDrpcHttpCredentialsPlugin conf)] 
-      (.addShutdownHook (Runtime/getRuntime) (Thread. (fn []
-                                                        (if handler-server (.stop handler-server))
-                                                        (.stop invoke-server))))
+      (add-shutdown-hook-with-force-kill-in-1-sec (fn []
+                                                    (if handler-server (.stop handler-server))
+                                                    (.stop invoke-server)))
       (log-message "Starting Distributed RPC servers...")
       (future (.serve invoke-server))
       (when (> drpc-http-port 0)
@@ -220,15 +229,15 @@
               https-ks-password (conf DRPC-HTTPS-KEYSTORE-PASSWORD)
               https-ks-type (conf DRPC-HTTPS-KEYSTORE-TYPE)]
 
-          (run-jetty app
-            {:port drpc-http-port :join? false
-             :configurator (fn [server]
-                             (config-ssl server
-                                         https-port 
-                                         https-ks-path 
-                                         https-ks-password
-                                         https-ks-type)
-                             (config-filter server app filters-confs))})))
+          (storm-run-jetty
+           {:port drpc-http-port
+            :configurator (fn [server]
+                            (config-ssl server
+                                        https-port
+                                        https-ks-path
+                                        https-ks-password
+                                        https-ks-type)
+                            (config-filter server app filters-confs))})))
       (when handler-server
         (.serve handler-server)))))
 
