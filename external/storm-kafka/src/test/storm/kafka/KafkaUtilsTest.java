@@ -1,3 +1,20 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package storm.kafka;
 
 import backtype.storm.spout.SchemeAsMultiScheme;
@@ -6,13 +23,14 @@ import com.google.common.collect.ImmutableMap;
 import kafka.api.OffsetRequest;
 import kafka.javaapi.consumer.SimpleConsumer;
 import kafka.javaapi.message.ByteBufferMessageSet;
-import kafka.javaapi.producer.Producer;
 import kafka.message.MessageAndOffset;
-import kafka.producer.KeyedMessage;
-import kafka.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.Assert;
 import storm.kafka.trident.GlobalPartitionInformation;
 
 import java.util.List;
@@ -22,9 +40,11 @@ import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThat;
-
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 public class KafkaUtilsTest {
 
+    private static final Logger LOG = LoggerFactory.getLogger(KafkaUtilsTest.class);
     private KafkaTestBroker broker;
     private SimpleConsumer simpleConsumer;
     private KafkaConfig config;
@@ -82,30 +102,28 @@ public class KafkaUtilsTest {
                 new Partition(Broker.fromString(broker.getBrokerConnectionString()), 0), -99);
     }
 
-    @Test
+    @Test(expected = TopicOffsetOutOfRangeException.class)
     public void fetchMessagesWithInvalidOffsetAndDefaultHandlingEnabled() throws Exception {
         config = new KafkaConfig(brokerHosts, "newTopic");
         String value = "test";
         createTopicAndSendMessage(value);
-        ByteBufferMessageSet messageAndOffsets = KafkaUtils.fetchMessages(config, simpleConsumer,
+        KafkaUtils.fetchMessages(config, simpleConsumer,
                 new Partition(Broker.fromString(broker.getBrokerConnectionString()), 0), -99);
-        String message = new String(Utils.toByteArray(messageAndOffsets.iterator().next().message().payload()));
-        assertThat(message, is(equalTo(value)));
     }
 
     @Test
     public void getOffsetFromConfigAndDontForceFromStart() {
-        config.forceFromStart = false;
+        config.ignoreZkOffsets = false;
         config.startOffsetTime = OffsetRequest.EarliestTime();
         createTopicAndSendMessage();
-        long latestOffset = KafkaUtils.getOffset(simpleConsumer, config.topic, 0, OffsetRequest.LatestTime());
+        long latestOffset = KafkaUtils.getOffset(simpleConsumer, config.topic, 0, OffsetRequest.EarliestTime());
         long offsetFromConfig = KafkaUtils.getOffset(simpleConsumer, config.topic, 0, config);
         assertThat(latestOffset, is(equalTo(offsetFromConfig)));
     }
 
     @Test
     public void getOffsetFromConfigAndFroceFromStart() {
-        config.forceFromStart = true;
+        config.ignoreZkOffsets = true;
         config.startOffsetTime = OffsetRequest.EarliestTime();
         createTopicAndSendMessage();
         long earliestOffset = KafkaUtils.getOffset(simpleConsumer, config.topic, 0, OffsetRequest.EarliestTime());
@@ -122,6 +140,7 @@ public class KafkaUtilsTest {
     @Test
     public void generateTuplesWithKeyAndKeyValueScheme() {
         config.scheme = new KeyValueSchemeAsMultiScheme(new StringKeyValueScheme());
+        config.useStartOffsetTimeIfOffsetOutOfRange = false;
         String value = "value";
         String key = "key";
         createTopicAndSendMessage(key, value);
@@ -166,7 +185,6 @@ public class KafkaUtilsTest {
         }
     }
 
-
     private void createTopicAndSendMessage() {
         createTopicAndSendMessage(null, "someValue");
     }
@@ -177,13 +195,21 @@ public class KafkaUtilsTest {
 
     private void createTopicAndSendMessage(String key, String value) {
         Properties p = new Properties();
-        p.setProperty("metadata.broker.list", broker.getBrokerConnectionString());
-        p.setProperty("serializer.class", "kafka.serializer.StringEncoder");
-        ProducerConfig producerConfig = new ProducerConfig(p);
-        Producer<String, String> producer = new Producer<String, String>(producerConfig);
-        producer.send(new KeyedMessage<String, String>(config.topic, key, value));
+        p.put("acks", "1");
+        p.put("bootstrap.servers", broker.getBrokerConnectionString());
+        p.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        p.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        p.put("metadata.fetch.timeout.ms", 1000);
+        KafkaProducer<String, String> producer = new KafkaProducer<String, String>(p);
+        try {
+            producer.send(new ProducerRecord<String, String>(config.topic, key, value)).get();
+        } catch (Exception e) {
+            Assert.fail(e.getMessage());
+            LOG.error("Failed to do synchronous sending due to " + e, e);
+        } finally {
+            producer.close();
+        }
     }
-
 
     @Test
     public void assignOnePartitionPerTask() {

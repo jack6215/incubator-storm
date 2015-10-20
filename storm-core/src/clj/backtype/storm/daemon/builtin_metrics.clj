@@ -14,7 +14,7 @@
 ;; See the License for the specific language governing permissions and
 ;; limitations under the License.
 (ns backtype.storm.daemon.builtin-metrics
-  (:import [backtype.storm.metric.api MultiCountMetric MultiReducedMetric MeanReducer StateMetric])
+  (:import [backtype.storm.metric.api MultiCountMetric MultiReducedMetric CountMetric MeanReducer StateMetric IMetric IStatefulObject])
   (:import [backtype.storm Config])
   (:use [backtype.storm.stats :only [stats-rate]]))
 
@@ -30,6 +30,10 @@
                                ^MultiReducedMetric execute-latency
                                ^MultiCountMetric emit-count
                                ^MultiCountMetric transfer-count])
+(defrecord SpoutThrottlingMetrics [^CountMetric skipped-max-spout
+                                   ^CountMetric skipped-throttle
+                                   ^CountMetric skipped-inactive])
+
 
 (defn make-data [executor-type]
   (condp = executor-type
@@ -46,11 +50,38 @@
                                (MultiCountMetric.)
                                (MultiCountMetric.))))
 
+(defn make-spout-throttling-data []
+  (SpoutThrottlingMetrics. (CountMetric.)
+                           (CountMetric.)
+                           (CountMetric.)))
+
+(defn register-spout-throttling-metrics [throttling-metrics  storm-conf topology-context]
+  (doseq [[kw imetric] throttling-metrics]
+    (.registerMetric topology-context (str "__" (name kw)) imetric
+                     (int (get storm-conf Config/TOPOLOGY_BUILTIN_METRICS_BUCKET_SIZE_SECS)))))
+
 (defn register-all [builtin-metrics  storm-conf topology-context]
   (doseq [[kw imetric] builtin-metrics]
     (.registerMetric topology-context (str "__" (name kw)) imetric
                      (int (get storm-conf Config/TOPOLOGY_BUILTIN_METRICS_BUCKET_SIZE_SECS)))))
-          
+
+(defn register-iconnection-server-metric [server storm-conf topology-context]
+  (if (instance? IStatefulObject server)
+    (.registerMetric topology-context "__recv-iconnection" (StateMetric. server)
+                     (int (get storm-conf Config/TOPOLOGY_BUILTIN_METRICS_BUCKET_SIZE_SECS)))))
+
+(defn register-iconnection-client-metrics [node+port->socket-ref storm-conf topology-context]
+  (.registerMetric topology-context "__send-iconnection"
+    (reify IMetric
+      (^Object getValueAndReset [this]
+        (into {}
+          (map
+            (fn [[node+port ^IStatefulObject connection]] [node+port (.getState connection)])
+            (filter 
+              (fn [[node+port connection]] (instance? IStatefulObject connection))
+              @node+port->socket-ref)))))
+    (int (get storm-conf Config/TOPOLOGY_BUILTIN_METRICS_BUCKET_SIZE_SECS))))
+ 
 (defn register-queue-metrics [queues storm-conf topology-context]
   (doseq [[qname q] queues]
     (.registerMetric topology-context (str "__" (name qname)) (StateMetric. q)
@@ -82,3 +113,12 @@
 
 (defn transferred-tuple! [m stats stream num-out-tasks]
   (-> m :transfer-count (.scope stream) (.incrBy (* num-out-tasks (stats-rate stats)))))
+
+(defn skipped-max-spout! [^SpoutThrottlingMetrics m stats]
+  (-> m .skipped-max-spout (.incrBy (stats-rate stats))))
+
+(defn skipped-throttle! [^SpoutThrottlingMetrics m stats]
+  (-> m .skipped-throttle (.incrBy (stats-rate stats))))
+
+(defn skipped-inactive! [^SpoutThrottlingMetrics m stats]
+  (-> m .skipped-inactive (.incrBy (stats-rate stats))))

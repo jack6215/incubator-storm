@@ -15,13 +15,12 @@
 ;; limitations under the License.
 (ns backtype.storm.scheduler-test
   (:use [clojure test])
-  (:use [backtype.storm bootstrap config testing])
+  (:use [backtype.storm config testing])
+  (:use [backtype.storm.scheduler EvenScheduler])
   (:require [backtype.storm.daemon [nimbus :as nimbus]])
   (:import [backtype.storm.generated StormTopology])
   (:import [backtype.storm.scheduler Cluster SupervisorDetails WorkerSlot ExecutorDetails
             SchedulerAssignmentImpl Topologies TopologyDetails]))
-
-(bootstrap)
 
 (defn clojurify-executor->slot [executorToSlot]
   (into {} (for [[executor slot] executorToSlot]
@@ -130,7 +129,8 @@
         assignment3 (SchedulerAssignmentImpl. "topology3" executor->slot3)
         cluster (Cluster. (nimbus/standalone-nimbus)
                           {"supervisor1" supervisor1 "supervisor2" supervisor2}
-                          {"topology1" assignment1 "topology2" assignment2 "topology3" assignment3})]
+                          {"topology1" assignment1 "topology2" assignment2 "topology3" assignment3}
+                  nil)]
     ;; test Cluster constructor
     (is (= #{"supervisor1" "supervisor2"}
            (->> cluster
@@ -259,3 +259,23 @@
     (is (= false (.isSlotOccupied cluster (WorkerSlot. "supervisor1" (int 3)))))
     (is (= false (.isSlotOccupied cluster (WorkerSlot. "supervisor1" (int 5)))))
     ))
+
+(deftest test-sort-slots
+  ;; test supervisor2 has more free slots
+  (is (= '(["supervisor2" 6700] ["supervisor1" 6700]
+           ["supervisor2" 6701] ["supervisor1" 6701]
+           ["supervisor2" 6702])
+         (sort-slots [["supervisor1" 6700] ["supervisor1" 6701]
+                      ["supervisor2" 6700] ["supervisor2" 6701] ["supervisor2" 6702]
+                      ])))
+  ;; test supervisor3 has more free slots
+  (is (= '(["supervisor3" 6700] ["supervisor2" 6700] ["supervisor1" 6700]
+           ["supervisor3" 6703] ["supervisor2" 6701] ["supervisor1" 6701]
+           ["supervisor3" 6702] ["supervisor2" 6702]
+           ["supervisor3" 6701])
+         (sort-slots [["supervisor1" 6700] ["supervisor1" 6701]
+                      ["supervisor2" 6700] ["supervisor2" 6701] ["supervisor2" 6702]
+                      ["supervisor3" 6700] ["supervisor3" 6703] ["supervisor3" 6702] ["supervisor3" 6701]
+                      ])))
+    )
+

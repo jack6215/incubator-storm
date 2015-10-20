@@ -13,9 +13,10 @@
 ;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 ;; See the License for the specific language governing permissions and
 ;; limitations under the License.
+
 (ns backtype.storm.LocalDRPC
   (:require [backtype.storm.daemon [drpc :as drpc]])
-  (:use [backtype.storm util])
+  (:use [backtype.storm config util])
   (:import [backtype.storm.utils InprocMessaging ServiceRegistry])
   (:gen-class
    :init init
@@ -24,7 +25,7 @@
    :state state ))
 
 (defn -init []
-  (let [handler (drpc/service-handler)
+  (let [handler (drpc/service-handler (read-storm-config))
         id (ServiceRegistry/registerService handler)
         ]
     [[] {:service-id id :handler handler}]
@@ -45,9 +46,9 @@
 (defn -failRequest [this id]
   (.failRequest (:handler (. this state)) id)
   )
-  
+
 (defn -getServiceId [this]
-  (:service-id (. this state)))  
+  (:service-id (. this state)))
 
 (defn -shutdown [this]
   (ServiceRegistry/unregisterService (:service-id (. this state)))

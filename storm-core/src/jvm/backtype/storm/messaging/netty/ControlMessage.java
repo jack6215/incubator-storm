@@ -17,6 +17,8 @@
  */
 package backtype.storm.messaging.netty;
 
+import java.io.IOException;
+
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBufferOutputStream;
 import org.jboss.netty.buffer.ChannelBuffers;
@@ -25,7 +27,9 @@ enum ControlMessage {
     CLOSE_MESSAGE((short)-100),
     EOB_MESSAGE((short)-201),
     OK_RESPONSE((short)-200),
-    FAILURE_RESPONSE((short)-400);
+    FAILURE_RESPONSE((short)-400),
+    SASL_TOKEN_MESSAGE_REQUEST((short)-202),
+    SASL_COMPLETE_REQUEST((short)-203);
 
     private short code;
 
@@ -54,14 +58,14 @@ enum ControlMessage {
      * encode the current Control Message into a channel buffer
      * @throws Exception
      */
-    ChannelBuffer buffer() throws Exception {
+    ChannelBuffer buffer() throws IOException {
         ChannelBufferOutputStream bout = new ChannelBufferOutputStream(ChannelBuffers.directBuffer(encodeLength()));      
         write(bout);
         bout.close();
         return bout.buffer();
     }
 
-    void write(ChannelBufferOutputStream bout) throws Exception {
+    void write(ChannelBufferOutputStream bout) throws IOException {
         bout.writeShort(code);        
     } 
 }

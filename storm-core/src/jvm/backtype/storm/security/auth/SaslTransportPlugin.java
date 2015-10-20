@@ -21,10 +21,18 @@ import java.io.IOException;
 import java.net.Socket;
 import java.security.Principal;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 import javax.security.auth.Subject;
 import javax.security.auth.login.Configuration;
 import javax.security.sasl.SaslServer;
+
+import backtype.storm.utils.ExtendedThreadPoolExecutor;
+import backtype.storm.security.auth.kerberos.NoOpTTrasport;
 import org.apache.thrift.TException;
 import org.apache.thrift.TProcessor;
 import org.apache.thrift.protocol.TBinaryProtocol;
@@ -40,38 +48,48 @@ import org.apache.thrift.transport.TTransportFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import backtype.storm.security.auth.ThriftConnectionType;
+
 /**
  * Base class for SASL authentication plugin.
  */
 public abstract class SaslTransportPlugin implements ITransportPlugin {
+    protected ThriftConnectionType type;
+    protected Map storm_conf;
     protected Configuration login_conf;
     private static final Logger LOG = LoggerFactory.getLogger(SaslTransportPlugin.class);
 
-    /**
-     * Invoked once immediately after construction
-     * @param conf Storm configuration 
-     * @param login_conf login configuration
-     */
-    public void prepare(Map storm_conf, Configuration login_conf) {        
+    @Override
+    public void prepare(ThriftConnectionType type, Map storm_conf, Configuration login_conf) {
+        this.type = type;
+        this.storm_conf = storm_conf;
         this.login_conf = login_conf;
     }
 
-    public TServer getServer(int port, TProcessor processor) throws IOException, TTransportException {
+    @Override
+    public TServer getServer(TProcessor processor) throws IOException, TTransportException {
+        int port = type.getPort(storm_conf);
         TTransportFactory serverTransportFactory = getServerTransportFactory();
-
-        //define THsHaServer args 
-        //original: THsHaServer + TNonblockingServerSocket
-        //option: TThreadPoolServer + TServerSocket
         TServerSocket serverTransport = new TServerSocket(port);
+        int numWorkerThreads = type.getNumThreads(storm_conf);
+        Integer queueSize = type.getQueueSize(storm_conf);
+
         TThreadPoolServer.Args server_args = new TThreadPoolServer.Args(serverTransport).
                 processor(new TUGIWrapProcessor(processor)).
-                minWorkerThreads(64).
-                maxWorkerThreads(64).
-                protocolFactory(new TBinaryProtocol.Factory());            
-        if (serverTransportFactory != null) 
-            server_args.transportFactory(serverTransportFactory);
+                minWorkerThreads(numWorkerThreads).
+                maxWorkerThreads(numWorkerThreads).
+                protocolFactory(new TBinaryProtocol.Factory(false, true));
 
-        //construct THsHaServer
+        if (serverTransportFactory != null) {
+            server_args.transportFactory(serverTransportFactory);
+        }
+        BlockingQueue workQueue = new SynchronousQueue();
+        if (queueSize != null) {
+            workQueue = new ArrayBlockingQueue(queueSize);
+        }
+        ThreadPoolExecutor executorService = new ExtendedThreadPoolExecutor(numWorkerThreads, numWorkerThreads,
+            60, TimeUnit.SECONDS, workQueue);
+        server_args.executorService(executorService);
         return new TThreadPoolServer(server_args);
     }
 
@@ -90,7 +108,7 @@ public abstract class SaslTransportPlugin implements ITransportPlugin {
      *                                                                                                                                                                              
      * This is used on the server side to set the UGI for each specific call.                                                                                                       
      */
-    private class TUGIWrapProcessor implements TProcessor {
+    private static class TUGIWrapProcessor implements TProcessor {
         final TProcessor wrapped;
 
         TUGIWrapProcessor(TProcessor wrapped) {
@@ -105,6 +123,10 @@ public abstract class SaslTransportPlugin implements ITransportPlugin {
             //Sasl transport
             TSaslServerTransport saslTrans = (TSaslServerTransport)trans;
 
+            if(trans instanceof NoOpTTrasport) {
+                return false;
+            }
+
             //remote address
             TSocket tsocket = (TSocket)saslTrans.getUnderlyingTransport();
             Socket socket = tsocket.getSocket();
@@ -116,7 +138,7 @@ public abstract class SaslTransportPlugin implements ITransportPlugin {
             Subject remoteUser = new Subject();
             remoteUser.getPrincipals().add(new User(authId));
             req_context.setSubject(remoteUser);
-            
+
             //invoke service handler
             return wrapped.process(inProt, outProt);
         }

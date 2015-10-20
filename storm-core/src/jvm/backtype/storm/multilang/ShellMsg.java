@@ -1,3 +1,20 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package backtype.storm.multilang;
 
 import java.util.ArrayList;
@@ -24,6 +41,28 @@ public class ShellMsg {
     private String msg;
     private List<Object> tuple;
     private boolean needTaskIds;
+
+    //metrics rpc 
+    private String metricName;
+    private Object metricParams;
+
+    //logLevel
+    public enum ShellLogLevel {
+        TRACE, DEBUG, INFO, WARN, ERROR;
+
+        public static ShellLogLevel fromInt(int i) {
+            switch (i) {
+                case 0: return TRACE;
+                case 1: return DEBUG;
+                case 2: return INFO;
+                case 3: return WARN;
+                case 4: return ERROR;
+                default: return INFO;
+            }
+        }
+    }
+
+    private ShellLogLevel logLevel = ShellLogLevel.INFO;
 
     public String getCommand() {
         return command;
@@ -101,5 +140,46 @@ public class ShellMsg {
 
     public void setNeedTaskIds(boolean needTaskIds) {
         this.needTaskIds = needTaskIds;
+    }
+
+    public void setMetricName(String metricName) {
+        this.metricName = metricName;
+    }
+
+    public String getMetricName() {
+        return this.metricName;
+    }
+
+    public void setMetricParams(Object metricParams) {
+        this.metricParams = metricParams;
+    }
+
+    public Object getMetricParams() {
+        return metricParams;
+    }
+
+    public ShellLogLevel getLogLevel() {
+        return logLevel;
+    }
+
+    public void setLogLevel(int logLevel) {
+        this.logLevel = ShellLogLevel.fromInt(logLevel);
+    }
+
+    @Override
+    public String toString() {
+        return "ShellMsg{" +
+                "command='" + command + '\'' +
+                ", id=" + id +
+                ", anchors=" + anchors +
+                ", stream='" + stream + '\'' +
+                ", task=" + task +
+                ", msg='" + msg + '\'' +
+                ", tuple=" + tuple +
+                ", needTaskIds=" + needTaskIds +
+                ", metricName='" + metricName + '\'' +
+                ", metricParams=" + metricParams +
+                ", logLevel=" + logLevel +
+                '}';
     }
 }
